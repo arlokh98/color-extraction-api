@@ -1,23 +1,17 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageChops
 import io
-import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from skimage.metrics import structural_similarity as ssim
-import numpy as np
-import os
 import glob
+import os
+import base64
+from skimage.metrics import structural_similarity as ssim
+from collections import OrderedDict
 from priority_cache_manager import PriorityCacheManager
-import logging
+import cv2
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import ImageEnhance
-
-logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG to see all debug logs
-    format='[%(levelname)s] %(message)s'
-)
-
-logger = logging.getLogger(__name__)
 
 
 app = Flask(__name__)
@@ -25,11 +19,6 @@ app = Flask(__name__)
 REFERENCE_IMAGE_SIZE = 2810
 CONFIDENCE_THRESHOLD_CIRCLE = 0.85
 CONFIDENCE_THRESHOLD_DIAMOND = 0.89
-
-priority_cache = PriorityCacheManager(original_capacity=6, scaled_capacity=6)
-
-def hex_to_rgb(hex_color):
-    return tuple(int(hex_color[i:i+2], 16) for i in (1, 3, 5))
 
 RAW_COLOR_MAP = {
     "#F156FF": "decision",
@@ -47,7 +36,6 @@ RAW_COLOR_MAP = {
 }
 
 COLOR_MAP = {k.upper(): v for k, v in RAW_COLOR_MAP.items()}
-RGB_COLOR_MAP = {hex_to_rgb(k): v for k, v in COLOR_MAP.items()}
 
 islandCenters = [
     { "bgX": 1404.5, "bgY": 343.5 },
@@ -157,6 +145,7 @@ arrowPointsD = [
     [[1779, 2081], [1822, 2038]],
     [[1515, 2345], [1558, 2302]]
 ]
+
 icon_points = [
             { "leftX": 1304, "leftY": 343, "rightX": 1504, "rightY": 343 },
             { "leftX": 1040, "leftY": 607, "rightX": 1240, "rightY": 607 },
@@ -190,101 +179,38 @@ symbol_categories = {"portal", "arrival", "shop"}
 ssim_categories = {"decision"}
 image_categories = {"battle", "boss"}
 
-def preprocess_crop_and_gray(img, x, y, scale, radius=100, size=(118, 118)):
-    """
-    Crop a diamond shape, convert to grayscale, resize, and return the image and NumPy array.
-    """
-    scaled_x, scaled_y = int(x * scale), int(y * scale)
-    crop_coords = [
-        (scaled_x, scaled_y - radius), (scaled_x - radius, scaled_y),
-        (scaled_x, scaled_y + radius), (scaled_x + radius, scaled_y)
-    ]
-    mask = Image.new("L", img.size, 0)
-    ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
-    cropped = Image.composite(img, Image.new("RGBA", img.size, (0, 0, 0, 0)), mask).crop(
-        (scaled_x - radius, scaled_y - radius, scaled_x + radius, scaled_y + radius)
-    )
-    gray_resized = cropped.convert("L").resize(size)
-    return cropped, gray_resized
-
 def preprocess_crop(crop, size=(118, 118)):
     enhancer = ImageEnhance.Contrast(crop.convert("L"))
     boosted = enhancer.enhance(1.5)  # increase contrast
     return boosted.resize(size)
 
-class ImageContext:
-    def __init__(self, image_url):
-        self.image_url = image_url
-        self.image = self._load_image()
-        self.scale = get_image_scale(self.image)
-
-        # Preprocess once and reuse
-        self.gray_image = self.image.convert("L")
-        self.contrast_image = ImageEnhance.Contrast(self.gray_image).enhance(1.5)
-        self.img_np = np.array(self.image)  # RGB NumPy array
-
-    def _load_image(self):
-        # Use cache or fetch image from URL
-        response = requests.get(self.image_url)
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch image: {self.image_url}")
-        return Image.open(io.BytesIO(response.content)).convert("RGBA")
-
-    def get_pixel(self, x, y):
-        sx, sy = int(x * self.scale), int(y * self.scale)
-        return self.image.getpixel((sx, sy))
-
-    def crop_diamond(self, x, y, radius=100):
-        """
-        Crop a diamond-shaped region centered at (x, y), scaled appropriately.
-        """
-        scaled_x = int(x * self.scale)
-        scaled_y = int(y * self.scale)
-        crop_coords = [
-            (scaled_x, scaled_y - radius), (scaled_x - radius, scaled_y),
-            (scaled_x, scaled_y + radius), (scaled_x + radius, scaled_y)
-        ]
-
-        mask = Image.new("L", self.image.size, 0)
-        ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
-
-        return Image.composite(
-            self.image,
-            Image.new("RGBA", self.image.size, (0, 0, 0, 0)),
-            mask
-        ).crop((
-            scaled_x - radius,
-            scaled_y - radius,
-            scaled_x + radius,
-            scaled_y + radius
-        ))
-
 def enhance_contrast(img, factor=1.5):
     return ImageEnhance.Contrast(img).enhance(factor)
+
+def hex_to_rgb(hex_color):
+    return tuple(int(hex_color[i:i+2], 16) for i in (1, 3, 5))
 
 def color_distance(c1, c2):
     return sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5
 
 def closest_color(pixel):
-    best_match = None
-    best_distance = float("inf")
+    closest_hex = None
+    closest_dist = float("inf")
 
-    for ref_rgb, label in RGB_COLOR_MAP.items():
-        dist = color_distance(pixel, ref_rgb)
-        if dist < best_distance:
-            best_distance = dist
-            best_match = (ref_rgb, label)
+    for hex_code in COLOR_MAP.keys():
+        color_rgb = hex_to_rgb(hex_code)
+        dist = color_distance(pixel, color_rgb)
+        if dist < closest_dist:
+            closest_dist = dist
+            closest_hex = hex_code
 
-    if best_match:
-        ref_rgb, label = best_match
-        threshold = 4 if label == "arrival" else 0.5
-        match_result = ref_rgb if best_distance < threshold else "other"
-        
-        logger.debug(f"[closest_color] Pixel: {pixel} → Closest: {label} {ref_rgb}, Distance: {best_distance:.2f}, Threshold: {threshold}, Result: {match_result}")
-        return match_result
+    if closest_dist < 20:
+        return closest_hex  # fuzzy match accepted
 
-    logger.debug(f"[closest_color] Pixel: {pixel} → No match found")
-    return "other"
+    # No acceptable match — return exact color as hex
+    return "#{:02X}{:02X}{:02X}".format(pixel[0], pixel[1], pixel[2])
+
+priority_cache = PriorityCacheManager(original_capacity=6, scaled_capacity=6)
 
 CANNOT_BE_MINION_COLORS = {
     "#2DB38F",  # Easy
@@ -293,21 +219,21 @@ CANNOT_BE_MINION_COLORS = {
 }
 
 MONSTER_HEX = "#262B34"  # Dark fallback (Monster)
-CANNOT_BE_MINION_RGB = {hex_to_rgb(c) for c in CANNOT_BE_MINION_COLORS}
-MONSTER_RGB = hex_to_rgb(MONSTER_HEX)
-def is_monster_color(pixel_rgb):
-    return color_distance(pixel_rgb, MONSTER_RGB) <= MONSTER_THRESHOLD
-def is_minion_color(pixel_rgb):
-    if pixel_rgb in CANNOT_BE_MINION_RGB or is_monster_color(pixel_rgb):
+MONSTER_THRESHOLD = 10  # Allow fuzzy match within distance 10
+def is_monster_color(pixel_hex):
+    pixel_rgb = hex_to_rgb(pixel_hex)
+    monster_rgb = hex_to_rgb(MONSTER_HEX)
+    return color_distance(pixel_rgb, monster_rgb) <= MONSTER_THRESHOLD
+
+def is_minion_color(pixel_hex):
+    if pixel_hex.upper() in CANNOT_BE_MINION_COLORS or is_monster_color(pixel_hex):
         return False
     return True
-
-MONSTER_THRESHOLD = 10  # Allow fuzzy match within distance 10
 
 def download_image(image_url):
     cached_image = priority_cache.get_original(image_url)
     if cached_image:
-        logging.info(f"Using cached original for {image_url}")
+        print(f"Using cached original for {image_url}")
         return cached_image
 
     response = requests.get(image_url)
@@ -315,17 +241,8 @@ def download_image(image_url):
         raise Exception(f"Cloudinary returned error {response.status_code}.")
 
     img = Image.open(io.BytesIO(response.content)).convert("RGBA")
-    priority_cache.store_original(image_url, img)
+    priority_cache.store_original(image_url, img)  # Auto-tracks batch/type if present
     return img
-def preprocess_full_image(image):
-    img_np = np.array(image.convert("RGB"))
-    img_gray = np.array(image.convert("L"))
-    return {
-        "original": image,
-        "rgb_array": img_np,
-        "gray_array": img_gray,
-        "scale": image.width / REFERENCE_IMAGE_SIZE
-    }
 
 def get_image_scale(image):
     return image.width / REFERENCE_IMAGE_SIZE
@@ -346,23 +263,27 @@ def preload_er_icon_templates(directories, er_scaled_size=118):
                 "er_scaled": scaled_array
             }
     
-    logging.info(f"[TEMPLATE LOAD] Loaded template: {name} from {file}")
+    print(f"[TEMPLATE LOAD] Loaded template: {name} from {file}")
     return templates
+
+
 
 icon_templates = preload_er_icon_templates(["iconsER"], er_scaled_size=118)
 
-def image_similarity_ssim(gray1_np, gray2_np):
-    return ssim(gray1_np, gray2_np, full=False)
+def image_similarity_ssim(img1, img2):
+    img1_gray = np.array(img1.convert("L"))
+    img2_gray = np.array(img2.convert("L").resize(img1.size))
+    score, _ = ssim(img1_gray, img2_gray, full=True)
+    return score
 
-def find_best_match_icon_np(gray_crop_np, threshold=0.85):
+def find_best_match_icon(preprocessed_img, threshold=0.85):
+    img_array = np.array(preprocessed_img)
     best_score = -1
     best_name = "other"
 
-    for name, template in icon_templates.items():
-        template_np = template["er_scaled"]
-        if gray_crop_np.shape != template_np.shape:
-            continue
-        score = ssim(gray_crop_np, template_np)
+    for name in sorted(icon_templates.keys()):
+        template_array = icon_templates[name]["er_scaled"]
+        score = ssim(img_array, template_array)
         if score > best_score:
             best_score = score
             best_name = name
@@ -372,33 +293,42 @@ def find_best_match_icon_np(gray_crop_np, threshold=0.85):
         "score": best_score
     }
 
-def best_shifted_match(ctx: ImageContext, x, y, threshold=0.85):
+def best_shifted_match(x, y, image, threshold=0.85):
+    scale = get_image_scale(image)
+    scaled_x = int(x * scale)
+    scaled_y = int(y * scale)
+    radius = int(100 * scale)
+
+    best_result = {"label": "other", "score": -1, "base64": ""}
     best_crop = None
-    best_score = -1
-    best_label = "other"
 
-    # Try center and then shifted ±1 and ±2 pixels
-    for shift in [0, 1, 2]:
-        for dx in [-shift, 0, shift]:
-            for dy in [-shift, 0, shift]:
-                if shift != 0 and dx == 0 and dy == 0:
-                    continue
+    def crop_and_match(dx, dy):
+        cx, cy = scaled_x + dx, scaled_y + dy
+        crop_coords = [
+            (cx, cy - radius), (cx - radius, cy),
+            (cx, cy + radius), (cx + radius, cy)
+        ]
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
+        cropped = Image.composite(image, Image.new("RGBA", image.size, (0, 0, 0, 0)), mask).crop(
+            (cx - radius, cy - radius, cx + radius, cy + radius)
+        )
+        pre = preprocess_crop(cropped)  # grayscale + contrast + resize
+        match = find_best_match_icon(pre, threshold)
+        return match, cropped
 
-                crop = ctx.crop_diamond(x + dx, y + dy)
-                processed = preprocess_crop(crop)
-                gray_np = np.array(processed)
+    for dx in [-2, -1, 0, 1, 2]:
+        for dy in [-2, -1, 0, 1, 2]:
+            match, cropped = crop_and_match(dx, dy)
+            if match["score"] > best_result["score"]:
+                best_result = match
+                best_crop = cropped
 
-                match = find_best_match_icon_np(gray_np, threshold)
-                if match["score"] > best_score:
-                    best_score = match["score"]
-                    best_label = match["label"]
-                    best_crop = crop
+    if best_crop:
+        best_result["base64"] = image_to_base64(best_crop)
 
-    return {
-        "label": best_label,
-        "score": best_score,
-        "base64": image_to_base64(best_crop) if best_crop else ""
-    }
+    return best_result
+
 
 def image_to_base64(img):
     buffer = io.BytesIO()
@@ -411,13 +341,14 @@ def extract_color():
     x, y = int(request.args.get("x", 0)), int(request.args.get("y", 0))
 
     try:
-        ctx = ImageContext(image_url)
-        pixel = ctx.np_img[int(y * ctx.scale), int(x * ctx.scale)]
-        pixel_rgb = tuple(pixel[:3])
-        hex_result = closest_color(pixel_rgb)
-        return jsonify({"hex": hex_result})
+        image = download_image(image_url)
+        scale_factor = get_image_scale(image)
+        pixel = image.getpixel((int(x * scale_factor), int(y * scale_factor)))
+
+        color_result = closest_color(pixel)
+        return jsonify({"hex": color_result})
+
     except Exception as e:
-        logger.exception("Error in extract_color")
         return jsonify({"error": str(e)})
 
 @app.route('/check_minion', methods=['GET'])
@@ -426,175 +357,217 @@ def check_minion():
     x, y = int(request.args.get("x", 0)), int(request.args.get("y", 0))
 
     try:
-        ctx = ImageContext(image_url)
-        pixel = ctx.np_img[int(y * ctx.scale), int(x * ctx.scale)]
-        pixel_rgb = tuple(pixel[:3])
-        return jsonify({"minion": is_minion_color(pixel_rgb)})
+        image = download_image(image_url)
+        scale_factor = get_image_scale(image)
+        pixel = image.getpixel((int(x * scale_factor), int(y * scale_factor)))
+        pixel_hex = "#{:02X}{:02X}{:02X}".format(pixel[0], pixel[1], pixel[2])
+
+        return jsonify({"minion": is_minion_color(pixel_hex)})
+
     except Exception as e:
-        logger.exception("Error in check_minion")
         return jsonify({"error": str(e)})
 
-@app.route("/extract_all_categories", methods=["POST"])
+@app.route('/extract_all_categories', methods=['POST'])
 def extract_all_categories():
-    data = request.get_json()
-    image_url = data.get("image_url")
-    logger.info(f"📥 [extract_all_categories] Image URL received: {image_url}")
-
     try:
-        ctx = ImageContext(image_url)
-        img_np = ctx.img_np
-        scale = ctx.scale
-        results = []
+        data = request.get_json()
+        image_url = data.get("image_url")
+        customCenters = data.get("islandCenters")
+        centers_to_use = customCenters if customCenters else islandCenters
+
+        if not image_url:
+            return jsonify({"error": "Missing image_url"}), 400
+
+        img = download_image(image_url)
+        scale = get_image_scale(img)
 
         def process_island(i, center):
             try:
                 x_scaled = int(center["bgX"] * scale)
                 y_scaled = int(center["bgY"] * scale)
+                pixel = img.getpixel((x_scaled, y_scaled))
+                matched_hex = closest_color(pixel[:3])
+                island_type = COLOR_MAP.get(matched_hex, "Void") if matched_hex else "Void"
 
-                pixel = tuple(img_np[y_scaled, x_scaled][:3])
-                matched_rgb = closest_color(pixel)
+                boss_x = int(combatTypePoints[i]["bossX"] * scale)
+                boss_y = int(combatTypePoints[i]["bossY"] * scale)
+                boss_pixel = img.getpixel((boss_x, boss_y))
+                boss_hex = "#{:02X}{:02X}{:02X}".format(*boss_pixel[:3])
 
-                logger.debug(f"[Island {i}] Pixel RGB: {pixel} → Matched: {matched_rgb}")
+                minion_x = int(combatTypePoints[i]["minionX"] * scale)
+                minion_y = int(combatTypePoints[i]["minionY"] * scale)
+                minion_pixel = img.getpixel((minion_x, minion_y))
+                minion_hex = "#{:02X}{:02X}{:02X}".format(*minion_pixel[:3])
 
-                if matched_rgb == "other":
-                    island_type = "Void"
-                else:
-                    island_type = RGB_COLOR_MAP.get(matched_rgb, "Void")
-
-                logger.debug(f"[Island {i}] Island Type: {island_type}")
-
-                # === Combat/Boss/Minion logic ===
-                combat_type_helper = None
-                if center.get("bossX") and center.get("bossY"):
-                    boss_x = int(center["bossX"] * scale)
-                    boss_y = int(center["bossY"] * scale)
-                    boss_pixel = tuple(img_np[boss_y, boss_x][:3])
-                    if boss_pixel == hex_to_rgb("#E58F16"):
-                        combat_type_helper = "boss"
-
-                if center.get("minionX") and center.get("minionY"):
-                    minion_x = int(center["minionX"] * scale)
-                    minion_y = int(center["minionY"] * scale)
-                    minion_pixel = tuple(img_np[minion_y, minion_x][:3])
-                    if is_minion_color(minion_pixel):
-                        combat_type_helper = "minion"
+                combat_type_helper = "None"
+                if boss_hex.upper() == "#E58F16":
+                    combat_type_helper = "boss"
+                elif is_minion_color(minion_hex):
+                    combat_type_helper = "minion"
 
                 lower_type = island_type.lower()
                 if lower_type in ["easy", "medium", "hard"]:
-                    category = combat_type_helper if combat_type_helper else "Battle"
+                    category = combat_type_helper if combat_type_helper != "None" else "battle"
                 elif lower_type == "decision":
-                    category = "Decision"
+                    category = "decision"
                 elif lower_type == "shop":
-                    category = "Shop"
+                    category = "shop"
                 elif lower_type in ["portal", "arrival"]:
-                    category = "Portal"
+                    category = "portal"
                 elif lower_type in ["bronze door", "silver door", "gold door", "time lock"]:
-                    category = "Door"
+                    category = "door"
+
                 else:
                     category = "Void"
 
-                logger.debug(f"[Island {i}] Final Category: {category}")
+                print(f"Island {i+1} RGB: {pixel}, Closest Hex: {matched_hex}, Matched Type: {island_type}")
 
-                results.append({
-                    "index": i,
+                return {
+                    "index": i + 1,
                     "island_type": island_type,
                     "category": category
-                })
+                }
 
-            except Exception as e:
-                logger.warning(f"⚠️ Error processing island {i}: {e}")
+            except Exception as inner_e:
+                print(f"Error processing island {i+1}: {str(inner_e)}")
+                return {"index": i + 1, "island_type": "Void", "category": "Void"}
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(process_island, i + 1, center) for i, center in enumerate(islandCenters)]
-            [f.result() for f in futures]
+        results = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(process_island, i, center) for i, center in enumerate(centers_to_use)]
+            for f in as_completed(futures):
+                results.append(f.result())
 
-        return jsonify({"island_data": sorted(results, key=lambda x: x["index"])})
+        results.sort(key=lambda x: x["index"])
+        return jsonify({"island_data": results})
 
     except Exception as e:
-        logger.exception("❌ Unexpected error in extract_all_categories")
+        print("ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
 
 @app.route('/crop_circle', methods=['POST'])
 def crop_circle():
     data = request.get_json()
-    image_url = data.get("image_url")
-    x, y = int(data.get("x")), int(data.get("y"))
+    image_url, x, y = data.get("image_url"), int(data.get("x")), int(data.get("y"))
 
     try:
-        ctx = ImageContext(image_url)
-        x_scaled, y_scaled = int(x * ctx.scale), int(y * ctx.scale)
-        radius = int(24 * ctx.scale)
+        image = download_image(image_url)
+        scale_factor = get_image_scale(image)
+        x_scaled, y_scaled = int(x * scale_factor), int(y * scale_factor)
+        radius = int(24 * scale_factor)
 
-        mask = Image.new("L", ctx.img.size, 0)
+        mask = Image.new("L", image.size, 0)
         draw = ImageDraw.Draw(mask)
         draw.ellipse((x_scaled - radius, y_scaled - radius, x_scaled + radius, y_scaled + radius), fill=255)
 
-        cropped_img = Image.composite(ctx.img, Image.new("RGBA", ctx.img.size, (0, 0, 0, 0)), mask).crop(
+        cropped_img = Image.composite(image, Image.new("RGBA", image.size, (0,0,0,0)), mask).crop(
             (x_scaled - radius, y_scaled - radius, x_scaled + radius, y_scaled + radius))
 
-        label = find_best_match_icon_np(preprocess_crop(cropped_img), CONFIDENCE_THRESHOLD_CIRCLE)
-        base64_result = image_to_base64(cropped_img)
+        label = find_best_match_icon(cropped_img, CONFIDENCE_THRESHOLD_CIRCLE)
+        output = io.BytesIO()
+        cropped_img.save(output, format="PNG")
+        image_base64 = base64.b64encode(output.getvalue()).decode("utf-8")
+        priority_cache.store_scaled(image_url, 48, cropped_img)  # assuming 48px target scale for small crops
 
-        return jsonify({"label": label, "base64": base64_result})
+        return jsonify({"label": label, "base64": image_base64})
 
     except Exception as e:
-        logger.exception("Error in crop_circle")
         return jsonify({"error": str(e)})
 
 @app.route('/crop_diamond', methods=['POST'])
 def crop_diamond():
     data = request.get_json()
-    image_url = data.get("image_url")
-    x, y = int(data.get("x")), int(data.get("y"))
+    image_url, x, y = data.get("image_url"), int(data.get("x")), int(data.get("y"))
 
     try:
-        ctx = ImageContext(image_url)
-        crop = ctx.crop_diamond(x, y)
-        label = find_best_match_icon_np(preprocess_crop(crop), CONFIDENCE_THRESHOLD_DIAMOND)
-        base64_result = image_to_base64(crop)
+        image = download_image(image_url)
+        scale_factor = get_image_scale(image)
+        scaled_x, scaled_y = int(x * scale_factor), int(y * scale_factor)
+        radius = int(100 * scale_factor)
 
-        return jsonify({"label": label, "base64": base64_result})
+        crop_coords = [
+            (scaled_x, scaled_y - radius), (scaled_x - radius, scaled_y),
+            (scaled_x, scaled_y + radius), (scaled_x + radius, scaled_y)
+        ]
+
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
+
+        cropped_img = Image.composite(image, Image.new("RGBA", image.size, (0, 0, 0, 0)), mask).crop(
+            (scaled_x - radius, scaled_y - radius, scaled_x + radius, scaled_y + radius)
+        )
+
+        # Get label from icon matching
+        label = find_best_match_icon(cropped_img, CONFIDENCE_THRESHOLD_DIAMOND)
+
+        output = io.BytesIO()
+        cropped_img.save(output, format="PNG")
+        image_base64 = base64.b64encode(output.getvalue()).decode("utf-8")
+
+        scale = image.width / 2810
+        priority_cache.store_scaled(image_url, scale, cropped_img)
+
+        return jsonify({
+            "base64": image_base64,
+            "label": label
+        })
 
     except Exception as e:
-        logger.exception("Error in crop_diamond")
         return jsonify({"error": str(e)})
+
 def crop_diamond_to_file(image_url, x, y, output_path="diamond_crop.png"):
     try:
-        ctx = ImageContext(image_url)
-        crop = ctx.crop_diamond(x, y)
-        crop.save(output_path)
+        img = download_image(image_url)
+        scale_factor = get_image_scale(img)
+        scaled_x, scaled_y = int(x * scale_factor), int(y * scale_factor)
+        radius = int(100 * scale_factor)
+
+        crop_coords = [
+            (scaled_x, scaled_y - radius), (scaled_x - radius, scaled_y),
+            (scaled_x, scaled_y + radius), (scaled_x + radius, scaled_y)
+        ]
+
+        mask = Image.new("L", img.size, 0)
+        ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
+
+        cropped_img = Image.composite(img, Image.new("RGBA", img.size, (0, 0, 0, 0)), mask).crop(
+            (scaled_x - radius, scaled_y - radius, scaled_x + radius, scaled_y + radius)
+        )
+
+        cropped_img.save(output_path)
         return f"Saved diamond crop to {output_path}"
     except Exception as e:
-        logger.exception("Error in crop_diamond_to_file")
         return f"Error: {str(e)}"
 
 @app.route('/crop_small_diamond', methods=['POST'])
 def crop_small_diamond():
     data = request.get_json()
-    image_url = data.get("image_url")
-    x, y = int(data.get("x")), int(data.get("y"))
+    image_url, x, y = data.get("image_url"), int(data.get("x")), int(data.get("y"))
 
     try:
-        ctx = ImageContext(image_url)
-        x_scaled, y_scaled = int(x * ctx.scale), int(y * ctx.scale)
-        offset = int(32 * ctx.scale)
+        image = download_image(image_url)
+        scale_factor = get_image_scale(image)
+        x_scaled, y_scaled = int(x * scale_factor), int(y * scale_factor)
+        offset = int(32 * scale_factor)
 
         crop_coords = [
             (x_scaled, y_scaled - offset), (x_scaled - offset, y_scaled),
             (x_scaled, y_scaled + offset), (x_scaled + offset, y_scaled)
         ]
 
-        mask = Image.new("L", ctx.img.size, 0)
+        mask = Image.new("L", image.size, 0)
         ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
 
-        cropped_img = Image.composite(ctx.img, Image.new("RGBA", ctx.img.size, (0, 0, 0, 0)), mask).crop(
+        cropped_img = Image.composite(image, Image.new("RGBA", image.size, (0,0,0,0)), mask).crop(
             (x_scaled - offset, y_scaled - offset, x_scaled + offset, y_scaled + offset))
 
-        base64_result = image_to_base64(cropped_img)
-        return jsonify({"image_base64": base64_result})
+        output = io.BytesIO()
+        cropped_img.save(output, format="PNG")
+        image_base64 = base64.b64encode(output.getvalue()).decode("utf-8")
+
+        return jsonify({"image_base64": image_base64})
 
     except Exception as e:
-        logger.exception("Error in crop_small_diamond")
         return jsonify({"error": str(e)})
 
 @app.route('/arrow_check_bulk', methods=['POST'])
@@ -602,13 +575,19 @@ def arrow_check_bulk():
     try:
         data = request.get_json()
         image_url = data.get("image_url")
+
         if not image_url:
             return jsonify({"error": "Missing image_url"}), 400
 
-        ctx = ImageContext(image_url)
+        pointsA = arrowPointsA
+        pointsD = arrowPointsD
+
+        img = download_image(image_url)
+        scale = get_image_scale(img)
 
         def check_color(x, y):
-            pixel = ctx.get_pixel(x, y)
+            scaled_x, scaled_y = int(x * scale), int(y * scale)
+            pixel = img.getpixel((scaled_x, scaled_y))
             hex_color = "#{:02X}{:02X}{:02X}".format(*pixel[:3])
             accepted_colors = {
                 "#F156FF", "#FFFFFF", "#2DB38F", "#ECD982", "#E5E4E2",
@@ -621,17 +600,18 @@ def arrow_check_bulk():
                 return ["skip", "skip"]
             else:
                 (x1, y1), (x2, y2) = entry
-                return [check_color(x1, y1), check_color(x2, y2)]
+                result1 = check_color(x1, y1)
+                result2 = check_color(x2, y2)
+                return [result1, result2]
 
         results = {
-            "A": [process_arrow_pair(entry) for entry in arrowPointsA],
-            "D": [process_arrow_pair(entry) for entry in arrowPointsD]
+            "A": [process_arrow_pair(entry) for entry in pointsA],
+            "D": [process_arrow_pair(entry) for entry in pointsD]
         }
 
         return jsonify(results)
 
     except Exception as e:
-        logger.exception("Error in arrow_check_bulk")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/crop_all_decision_icons', methods=['POST'])
@@ -645,108 +625,193 @@ def crop_all_decision_icons():
         if not categories or len(categories) != 25:
             return jsonify({"error": "categories must be a 25-item list"}), 400
 
-        ctx = ImageContext(image_url)
+        img = download_image(image_url)
+
+        def crop_diamond_scaled(x, y):
+            scale = get_image_scale(img)
+            scaled_x = int(x * scale)
+            scaled_y = int(y * scale)
+            radius = int(100 * scale)
+
+            crop_coords = [
+                (scaled_x, scaled_y - radius), (scaled_x - radius, scaled_y),
+                (scaled_x, scaled_y + radius), (scaled_x + radius, scaled_y)
+            ]
+
+            mask = Image.new("L", img.size, 0)
+            ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
+
+            return Image.composite(img, Image.new("RGBA", img.size, (0, 0, 0, 0)), mask).crop(
+                (scaled_x - radius, scaled_y - radius, scaled_x + radius, scaled_y + radius)
+            )
 
         def process_icon(idx):
             point = icon_points[idx]
             category = categories[idx].strip().lower()
+
             left_result = {"id": f"L{idx+1}", "label": "", "base64": ""}
             right_result = {"id": f"R{idx+1}", "label": "", "base64": ""}
 
             try:
-                if category == "decision":
-                    left = best_shifted_match(ctx, point["leftX"], point["leftY"])
-                    right = best_shifted_match(ctx, point["rightX"], point["rightY"])
-                    left_result.update({"label": left["label"], "base64": left["base64"]})
-                    right_result.update({"label": right["label"], "base64": right["base64"]})
+                if category in ssim_categories:
+                    left_match = best_shifted_match(point["leftX"], point["leftY"], img)
+                    right_match = best_shifted_match(point["rightX"], point["rightY"], img)
+                    left_result["label"] = left_match["label"]
+                    left_result["base64"] = left_match["base64"]
+                    right_result["label"] = right_match["label"]
+                    right_result["base64"] = right_match["base64"]
 
-                elif category in ["battle", "boss"]:
-                    left_result["label"] = right_result["label"] = category
 
-                elif "door" in category:
-                    left_result["label"] = right_result["label"] = "𓉞"
+                elif category in image_categories:
+                    left_crop = crop_diamond_scaled(point["leftX"], point["leftY"])
+                    right_crop = crop_diamond_scaled(point["rightX"], point["rightY"])
 
-                elif category in ["portal", "arrival", "shop"]:
+                    left_result["label"] = category
+                    right_result["label"] = category
+                    left_result["base64"] = image_to_base64(left_crop)
+                    right_result["base64"] = image_to_base64(right_crop)
+
+                elif category in door_categories:
+                    left_result["label"] = "𓉞"
+                    right_result["label"] = "𓉞"
+
+                elif category in symbol_categories:
                     left_result["label"] = "⋆₊˚⊹"
                     right_result["label"] = "࿔⋆"
 
             except Exception as e:
-                logger.warning(f"[Icon {idx+1}] Failed: {str(e)}")
+                print(f"Error processing icon {idx+1}: {str(e)}")
 
             return {"left": left_result, "right": right_result}
 
+
+
         results = []
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(process_icon, i) for i in range(25)]
+            futures = [executor.submit(process_icon, idx) for idx in range(25)]
             for f in as_completed(futures):
                 results.append(f.result())
 
-        results.sort(key=lambda r: int(r["left"]["id"][1:]))
+        results.sort(key=lambda r: int(r['left']['id'][1:]))
         return jsonify({"icons": results})
 
     except Exception as e:
-        logger.exception("Error in crop_all_decision_icons")
+        print("ERROR in crop_all_decision_icons:", str(e))
         return jsonify({"error": str(e)}), 500
 
-@app.route('/crop_diamond_to_file', methods=['POST'])
-def crop_diamond_to_file(image_url, x, y, output_path="diamond_crop.png"):
+
+@app.route('/debug_decision_icon_labels', methods=['POST'])
+def debug_decision_icon_labels():
     try:
-        ctx = ImageContext(image_url)
-        crop = ctx.crop_diamond(x, y)
-        crop.save(output_path)
-        return f"Saved diamond crop to {output_path}"
-    except Exception as e:
-        logger.exception("Error in crop_diamond_to_file")
-        return f"Error: {str(e)}"
+        data = request.get_json()
+        image_url = data.get("image_url")
+        categories = data.get("categories", [])
+        if not image_url:
+            return jsonify({"error": "Missing image_url"}), 400
+        if not categories or len(categories) != 25:
+            return jsonify({"error": "categories must be a 25-item list"}), 400
 
-@app.route("/debug_closest_color", methods=["POST"])
-def debug_closest_color():
-    data = request.get_json()
-    image_url = data.get("image_url")
-    logger.info(f"🧪 [debug_closest_color] Image: {image_url}")
+        img = download_image(image_url)
+        scale = get_image_scale(img)
 
-    try:
-        ctx = ImageContext(image_url)
-        img_np = ctx.img_np
-        scale = ctx.scale
+        def crop_diamond_scaled(x, y):
+            scaled_x, scaled_y = int(x * scale), int(y * scale)
+            radius = int(100 * scale)
+            crop_coords = [
+                (scaled_x, scaled_y - radius), (scaled_x - radius, scaled_y),
+                (scaled_x, scaled_y + radius), (scaled_x + radius, scaled_y)
+            ]
+            mask = Image.new("L", img.size, 0)
+            ImageDraw.Draw(mask).polygon(crop_coords, fill=255)
+            cropped = Image.composite(img, Image.new("RGBA", img.size, (0,0,0,0)), mask).crop(
+                (scaled_x - radius, scaled_y - radius, scaled_x + radius, scaled_y + radius)
+            )
+            return cropped
 
-        results = []
+        debug_output = []
 
-        for i, center in enumerate(islandCenters, 1):
-            x_scaled = int(center["bgX"] * scale)
-            y_scaled = int(center["bgY"] * scale)
-            pixel = tuple(int(v) for v in img_np[y_scaled, x_scaled][:3])
-            match = closest_color(pixel)
-            resolved = match if match == "other" else tuple(int(v) for v in match)
+        for idx in range(25):
+            point = icon_points[idx]
+            category = categories[idx].strip().lower()
 
-            distances = []
-            for ref_rgb, label in RGB_COLOR_MAP.items():
-                dist = color_distance(pixel, ref_rgb)
-                distances.append({
-                    "label": label,
-                    "ref_rgb": ref_rgb,
-                    "distance": round(dist, 2)
+            row = {"index": idx + 1, "category": category}
+
+            if category == "decision":
+                left_match = best_shifted_match(point["leftX"], point["leftY"], img)
+                right_match = best_shifted_match(point["rightX"], point["rightY"], img)
+
+                row.update({
+                    "left_label": left_match["label"],
+                    "left_score": left_match["score"],
+                    "right_label": right_match["label"],
+                    "right_score": right_match["score"]
                 })
 
-            distances.sort(key=lambda d: d["distance"])
+            else:
+                row.update({
+                    "left_label": "(skipped)",
+                    "right_label": "(skipped)"
+                })
 
-            results.append({
-                "index": i,
-                "center_coords": {"x": x_scaled, "y": y_scaled},
-                "pixel_rgb": pixel,
-                "matched_rgb": resolved,
-                "top_matches": distances[:3]
-            })
+            debug_output.append(row)
 
-        return jsonify({"results": results})
+        return jsonify(debug_output)
 
     except Exception as e:
-        logger.exception("❌ Error in debug_closest_color")
+        print("ERROR in debug_decision_icon_labels:", str(e))
         return jsonify({"error": str(e)}), 500
 
+
+
+@app.route('/crop_diamond_to_file', methods=['POST'])
+def crop_diamond_to_file_route():
+    try:
+        data = request.get_json()
+        image_url = data.get("image_url")
+        x = int(data.get("x"))
+        y = int(data.get("y"))
+        output_path = data.get("output_path", "diamond_crop.png")
+
+        result = crop_diamond_to_file(image_url, x, y, output_path)
+        return jsonify({"message": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/debug_icon_at_point', methods=['POST'])
+def debug_icon_at_point():
+    try:
+        data = request.get_json()
+        image_url = data.get("image_url")
+        x = int(data.get("x"))
+        y = int(data.get("y"))
+        threshold = float(data.get("threshold", 0.85))
+
+        if not image_url:
+            return jsonify({"error": "Missing image_url"}), 400
+
+        img = download_image(image_url)
+        best = best_shifted_match(x, y, img, threshold)
+
+        return jsonify({
+            "image_url": image_url,
+            "x": x,
+            "y": y,
+            "best_label": best["label"],
+            "best_score": best["score"],
+            "base64": best["base64"]
+        })
+
+    except Exception as e:
+        print("ERROR in debug_icon_at_point:", str(e))
+        return jsonify({"error": str(e)}), 500
+    
 @app.route('/status', methods=['GET'])
 def status():
     return jsonify(priority_cache.get_cache_status())
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), threaded=True)
+
+
+
